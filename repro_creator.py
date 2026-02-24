@@ -1009,6 +1009,109 @@ def install_apk_via_adb(apk_path: Path, adb_serial: str | None) -> None:
     run_checked(cmd, cwd=apk_path.parent)
 
 
+def adb_base_cmd(adb_serial: str | None) -> list[str]:
+    adb_bin = shutil.which("adb")
+    if adb_bin is None:
+        raise RuntimeError("`adb` is not installed or not on PATH.")
+    cmd = [adb_bin]
+    if adb_serial:
+        cmd.extend(["-s", adb_serial])
+    return cmd
+
+
+def list_installed_device_packages(adb_serial: str | None) -> list[str]:
+    adb_cmd = adb_base_cmd(adb_serial)
+    resolved = run_checked(adb_cmd + ["shell", "pm", "list", "packages", "-3"], cwd=Path.cwd())
+
+    packages = []
+    for line in resolved.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("package:"):
+            pkg = line.split("package:", 1)[1].strip()
+            if pkg:
+                packages.append(pkg)
+
+    packages = sorted(set(packages))
+    if not packages:
+        raise RuntimeError(
+            "No third-party packages found on device. Verify adb connectivity "
+            "or install at least one user app."
+        )
+    return packages
+
+
+def choose_package_interactively(packages: list[str]) -> str:
+    print("")
+    print("Installed third-party packages:")
+    for idx, pkg in enumerate(packages, start=1):
+        print(f"{idx}. {pkg}")
+
+    while True:
+        try:
+            selection = input("\nEnter package number to generate repro for: ").strip()
+        except EOFError as exc:
+            raise RuntimeError("No interactive input available for package selection.") from exc
+        if not selection:
+            print("Selection cannot be empty.")
+            continue
+        if not selection.isdigit():
+            print("Please enter a number.")
+            continue
+
+        index = int(selection)
+        if index < 1 or index > len(packages):
+            print(f"Please enter a value between 1 and {len(packages)}.")
+            continue
+        return packages[index - 1]
+
+
+def pull_apk_from_device(
+    out_dir: Path,
+    package_name: str,
+    adb_serial: str | None,
+) -> tuple[Path, list[Path]]:
+    adb_cmd = adb_base_cmd(adb_serial)
+
+    resolved = run_checked(adb_cmd + ["shell", "pm", "path", package_name], cwd=out_dir)
+    remote_paths = []
+    for line in resolved.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("package:"):
+            remote_paths.append(line.split("package:", 1)[1].strip())
+
+    if not remote_paths:
+        raise RuntimeError(
+            f"No APK paths found for installed package `{package_name}`. "
+            "Verify the package name and adb device connectivity."
+        )
+
+    source_dir = out_dir / "source-apk"
+    source_dir.mkdir(parents=True, exist_ok=True)
+
+    pulled_files: list[Path] = []
+    used_names: dict[str, int] = {}
+    for remote in remote_paths:
+        base_name = Path(remote).name
+        if not base_name:
+            base_name = "pulled.apk"
+
+        if base_name in used_names:
+            used_names[base_name] += 1
+            stem = Path(base_name).stem
+            suffix = Path(base_name).suffix
+            local_name = f"{stem}-{used_names[base_name]}{suffix}"
+        else:
+            used_names[base_name] = 1
+            local_name = base_name
+
+        local_path = source_dir / local_name
+        run_checked(adb_cmd + ["pull", remote, str(local_path)], cwd=out_dir)
+        pulled_files.append(local_path)
+
+    base_apk = next((p for p in pulled_files if p.name == "base.apk"), pulled_files[0])
+    return base_apk, pulled_files
+
+
 def generate_markdown_report(report: dict[str, Any]) -> str:
     lines = [
         "# APK Web Target Analysis",
@@ -1057,7 +1160,17 @@ def parse_args() -> argparse.Namespace:
             "without altering the original APK"
         )
     )
-    parser.add_argument("--apk", required=True, help="Path to source APK")
+    source_group = parser.add_mutually_exclusive_group(required=True)
+    source_group.add_argument("--apk", help="Path to source APK")
+    source_group.add_argument(
+        "--device-package",
+        help="Installed Android package name to pull APK from device via adb",
+    )
+    source_group.add_argument(
+        "--interactive-device-select",
+        action="store_true",
+        help="Interactively choose installed package from adb package list",
+    )
     parser.add_argument("--out", required=True, help="Output directory")
     parser.add_argument("--max-targets", type=int, default=20, help="Max URLs in harness")
     parser.add_argument(
@@ -1097,13 +1210,40 @@ def main() -> int:
     if args.install_via_adb:
         args.build_apk = True
 
-    apk_path = Path(args.apk).expanduser().resolve()
     out_dir = Path(args.out).expanduser().resolve()
-
-    if not apk_path.exists() or not apk_path.is_file():
-        raise SystemExit(f"APK does not exist: {apk_path}")
+    pulled_apks: list[Path] = []
+    source_descriptor = ""
 
     out_dir.mkdir(parents=True, exist_ok=True)
+    if args.interactive_device_select:
+        try:
+            packages = list_installed_device_packages(args.adb_serial)
+            selected_package = choose_package_interactively(packages)
+            apk_path, pulled_apks = pull_apk_from_device(
+                out_dir=out_dir,
+                package_name=selected_package,
+                adb_serial=args.adb_serial,
+            )
+        except RuntimeError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        source_descriptor = f"device-package:{selected_package}"
+    elif args.device_package:
+        try:
+            apk_path, pulled_apks = pull_apk_from_device(
+                out_dir=out_dir,
+                package_name=args.device_package,
+                adb_serial=args.adb_serial,
+            )
+        except RuntimeError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        source_descriptor = f"device-package:{args.device_package}"
+    else:
+        apk_path = Path(args.apk).expanduser().resolve()
+        if not apk_path.exists() or not apk_path.is_file():
+            raise SystemExit(f"APK does not exist: {apk_path}")
+        source_descriptor = f"apk-file:{apk_path}"
 
     scan = scan_apk_for_urls(apk_path, args.max_member_size_mb)
     url_hits: Counter[str] = scan["hits"]
@@ -1135,6 +1275,7 @@ def main() -> int:
     report = {
         "generatedAtUtc": generated_at,
         "apkPath": str(apk_path),
+        "sourceDescriptor": source_descriptor,
         "apkSha256": apk_hash,
         "packageName": package_name,
         "stats": {
@@ -1156,6 +1297,7 @@ def main() -> int:
     targets_payload = {
         "generatedAtUtc": generated_at,
         "sourceApkName": apk_path.name,
+        "sourceDescriptor": source_descriptor,
         "sourceApkSha256": apk_hash,
         "sourcePackageName": package_name,
         "targets": targets,
@@ -1213,6 +1355,11 @@ def main() -> int:
     print(f"Generated repro bundle at: {out_dir}")
     print(f"Analysis report: {analysis_dir / 'report.md'}")
     print(f"Android harness: {project_dir}")
+    print(f"Source: {source_descriptor}")
+    if pulled_apks:
+        print(f"Pulled APK files: {len(pulled_apks)}")
+        for path in pulled_apks:
+            print(f"- {path}")
     if built_apk_path is not None:
         print(f"Installable debug APK: {built_apk_path}")
         if args.install_via_adb:

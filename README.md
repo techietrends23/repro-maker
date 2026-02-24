@@ -21,6 +21,22 @@ python3 repro_creator.py \
   --out ./out/repro
 ```
 
+From an app already installed on device:
+```bash
+python3 repro_creator.py \
+  --device-package com.your.app \
+  --out ./out/repro \
+  --adb-serial YOUR_DEVICE_SERIAL
+```
+
+Interactive package picker from connected device:
+```bash
+python3 repro_creator.py \
+  --interactive-device-select \
+  --out ./out/repro \
+  --adb-serial YOUR_DEVICE_SERIAL
+```
+
 Optional flags:
 ```bash
 --max-targets 30
@@ -46,5 +62,7 @@ Optional flags:
 ## Notes
 - The original protected APK cannot be recreated exactly (different binary/signing keys).
 - `--build-apk` auto-downloads Gradle if it is not installed locally.
+- `--device-package` pulls the installed APK splits from device via `adb` and uses `base.apk` for analysis.
+- `--interactive-device-select` lists installed third-party packages (`pm list packages -3`) and prompts for a numeric selection.
 - If the APK is obfuscated/encrypted, URL extraction may be partial.
 - Add known URLs with `--extra-url` to force inclusion.
