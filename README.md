@@ -11,6 +11,7 @@ It does not modify the original app. It extracts likely web URLs from APK conten
 ## Requirements
 - Python 3.9+
 - Android Studio (to build/run generated harness)
+- Java 17+ (required when using `--build-apk`)
 - Optional: `aapt` or `apkanalyzer` for package-name extraction
 
 ## Usage
@@ -44,5 +45,6 @@ Optional flags:
 
 ## Notes
 - The original protected APK cannot be recreated exactly (different binary/signing keys).
+- `--build-apk` auto-downloads Gradle if it is not installed locally.
 - If the APK is obfuscated/encrypted, URL extraction may be partial.
 - Add known URLs with `--extra-url` to force inclusion.

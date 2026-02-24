@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -20,11 +21,14 @@ from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.error import URLError
 from urllib.parse import urlparse
+from urllib.request import urlretrieve
 
 URL_PATTERN = re.compile(rb"https?://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%\-]{4,}")
 DEFAULT_PACKAGE_ID = "com.reprocreator.harness"
 DEFAULT_APP_NAME = "WebView Repro Harness"
+DEFAULT_GRADLE_VERSION = "8.7"
 
 
 def utc_now() -> str:
@@ -896,30 +900,90 @@ def run_checked(cmd: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
     return completed
 
 
-def ensure_gradle_wrapper(project_dir: Path) -> Path:
-    gradlew = project_dir / "gradlew"
-    if gradlew.exists():
-        gradlew.chmod(gradlew.stat().st_mode | 0o111)
-        return gradlew
+def escape_gradle_path(path: Path) -> str:
+    return str(path).replace("\\", "\\\\").replace(":", "\\:")
 
-    gradle_bin = shutil.which("gradle")
-    if gradle_bin is None:
+
+def find_android_sdk_path() -> Path | None:
+    env_candidates = [
+        os.environ.get("ANDROID_SDK_ROOT"),
+        os.environ.get("ANDROID_HOME"),
+    ]
+    for candidate in env_candidates:
+        if candidate:
+            path = Path(candidate).expanduser().resolve()
+            if path.exists():
+                return path
+
+    home = Path.home()
+    path_candidates = [
+        home / "Library/Android/sdk",
+        home / "Android/Sdk",
+    ]
+    for path in path_candidates:
+        if path.exists():
+            return path.resolve()
+
+    return None
+
+
+def ensure_local_properties(project_dir: Path) -> None:
+    local_props = project_dir / "local.properties"
+    if local_props.exists():
+        return
+
+    sdk_dir = find_android_sdk_path()
+    if sdk_dir is None:
+        return
+
+    write_text(local_props, f"sdk.dir={escape_gradle_path(sdk_dir)}\n")
+
+
+def ensure_gradle_binary(cache_root: Path, gradle_version: str) -> Path:
+    system_gradle = shutil.which("gradle")
+    if system_gradle:
+        return Path(system_gradle).resolve()
+
+    cache_root.mkdir(parents=True, exist_ok=True)
+    gradle_home = cache_root / f"gradle-{gradle_version}"
+    gradle_bin = gradle_home / "bin/gradle"
+    if gradle_bin.exists():
+        gradle_bin.chmod(gradle_bin.stat().st_mode | 0o111)
+        return gradle_bin
+
+    archive = cache_root / f"gradle-{gradle_version}-bin.zip"
+    dist_url = f"https://services.gradle.org/distributions/gradle-{gradle_version}-bin.zip"
+
+    if not archive.exists():
+        try:
+            urlretrieve(dist_url, archive)
+        except URLError as exc:
+            raise RuntimeError(
+                "Failed to download Gradle distribution "
+                f"{dist_url}. Check network access. Details: {exc}"
+            ) from exc
+
+    try:
+        with zipfile.ZipFile(archive, "r") as zf:
+            zf.extractall(cache_root)
+    except zipfile.BadZipFile as exc:
         raise RuntimeError(
-            "Gradle wrapper not found in generated project and `gradle` is not installed. "
-            "Install Gradle, or open the project once in Android Studio to bootstrap wrapper files."
+            f"Downloaded Gradle archive is invalid: {archive}"
+        ) from exc
+
+    if not gradle_bin.exists():
+        raise RuntimeError(
+            f"Gradle binary not found after extraction: {gradle_bin}"
         )
 
-    run_checked([gradle_bin, "wrapper"], cwd=project_dir)
-    if not gradlew.exists():
-        raise RuntimeError("Failed to generate gradle wrapper (`gradlew`).")
-
-    gradlew.chmod(gradlew.stat().st_mode | 0o111)
-    return gradlew
+    gradle_bin.chmod(gradle_bin.stat().st_mode | 0o111)
+    return gradle_bin
 
 
 def build_debug_apk(project_dir: Path, out_dir: Path) -> Path:
-    gradlew = ensure_gradle_wrapper(project_dir)
-    run_checked([str(gradlew), "--no-daemon", "assembleDebug"], cwd=project_dir)
+    ensure_local_properties(project_dir)
+    gradle_bin = ensure_gradle_binary(out_dir / ".tool-cache", DEFAULT_GRADLE_VERSION)
+    run_checked([str(gradle_bin), "--no-daemon", "assembleDebug"], cwd=project_dir)
 
     apk_candidates = sorted((project_dir / "app/build/outputs/apk/debug").glob("*.apk"))
     if not apk_candidates:
@@ -1136,6 +1200,7 @@ def main() -> int:
           `python3 repro_creator.py --apk /path/to/app.apk --out /path/to/out --build-apk`
         - APK output path:
           `repro-harness-debug.apk`
+        - If Gradle is missing, the tool auto-downloads Gradle {DEFAULT_GRADLE_VERSION} under `.tool-cache/`.
 
         ## Notes
         - Source APK is not modified.
