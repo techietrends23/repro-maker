@@ -13,6 +13,7 @@ import json
 import re
 import shutil
 import subprocess
+import sys
 import textwrap
 import zipfile
 from collections import Counter, defaultdict
@@ -186,6 +187,8 @@ def main_activity_template(package_id: str) -> str:
         import android.os.Bundle
         import android.os.SystemClock
         import android.util.Log
+        import android.view.KeyEvent
+        import android.view.inputmethod.EditorInfo
         import android.webkit.ConsoleMessage
         import android.webkit.CookieManager
         import android.webkit.JavascriptInterface
@@ -267,8 +270,10 @@ def main_activity_template(package_id: str) -> str:
                         pageStartMs = SystemClock.elapsedRealtime()
                         commitVisibleMs = null
                         pageFinishedMs = null
+                        binding.etUrl.setText(url)
                         logLine("onPageStarted " + url)
                         updateSummary()
+                        updateNavButtons()
                     }
 
                     override fun onPageCommitVisible(view: WebView, url: String) {
@@ -283,6 +288,7 @@ def main_activity_template(package_id: str) -> str:
                         pageFinishedMs = SystemClock.elapsedRealtime()
                         logLine("onPageFinished " + url)
                         updateSummary()
+                        updateNavButtons()
                         collectWebPerf()
                     }
 
@@ -316,7 +322,7 @@ def main_activity_template(package_id: str) -> str:
             }
 
             private fun configureButtons() {
-                binding.btnLoad.setOnClickListener {
+                binding.btnLoadTarget.setOnClickListener {
                     if (targets.isEmpty()) {
                         logLine("No URL targets found")
                         return@setOnClickListener
@@ -325,13 +331,55 @@ def main_activity_template(package_id: str) -> str:
                     loadUrl(targets[index])
                 }
 
+                binding.btnGo.setOnClickListener {
+                    val input = binding.etUrl.text?.toString().orEmpty()
+                    val normalized = normalizeUrl(input)
+                    if (normalized == null) {
+                        logLine("Invalid URL: " + input)
+                        return@setOnClickListener
+                    }
+                    loadUrl(normalized)
+                }
+
+                binding.etUrl.setOnEditorActionListener { _, actionId, event ->
+                    val enterPressed = event?.keyCode == KeyEvent.KEYCODE_ENTER &&
+                        event.action == KeyEvent.ACTION_DOWN
+                    if (actionId == EditorInfo.IME_ACTION_GO || enterPressed) {
+                        binding.btnGo.performClick()
+                        true
+                    } else {
+                        false
+                    }
+                }
+
+                binding.btnBack.setOnClickListener {
+                    if (binding.webView.canGoBack()) {
+                        binding.webView.goBack()
+                    }
+                    updateNavButtons()
+                }
+
+                binding.btnForward.setOnClickListener {
+                    if (binding.webView.canGoForward()) {
+                        binding.webView.goForward()
+                    }
+                    updateNavButtons()
+                }
+
+                binding.btnReload.setOnClickListener {
+                    binding.webView.reload()
+                }
+
                 binding.btnClear.setOnClickListener {
                     CookieManager.getInstance().removeAllCookies(null)
                     CookieManager.getInstance().flush()
                     binding.webView.clearCache(true)
                     binding.webView.clearHistory()
                     logLine("Cache and cookies cleared")
+                    updateNavButtons()
                 }
+
+                updateNavButtons()
             }
 
             private fun loadTargets() {
@@ -359,11 +407,30 @@ def main_activity_template(package_id: str) -> str:
 
                 val sourceApk = payload.optString("sourceApkName", "unknown")
                 binding.tvSummary.text = "Source: " + sourceApk + " | Targets: " + targets.size
+                binding.etUrl.setText(targets.first())
             }
 
             private fun loadUrl(url: String) {
                 logLine("Loading " + url)
+                binding.etUrl.setText(url)
                 binding.webView.loadUrl(url)
+            }
+
+            private fun normalizeUrl(input: String): String? {
+                val trimmed = input.trim()
+                if (trimmed.isEmpty()) {
+                    return null
+                }
+
+                if (trimmed.startsWith("https://") || trimmed.startsWith("http://")) {
+                    return trimmed
+                }
+
+                if (trimmed.contains("://")) {
+                    return null
+                }
+
+                return "https://" + trimmed
             }
 
             private fun updateSummary() {
@@ -489,6 +556,11 @@ def main_activity_template(package_id: str) -> str:
                 }
 
                 binding.tvLog.append(entry + "\\n")
+            }
+
+            private fun updateNavButtons() {
+                binding.btnBack.isEnabled = binding.webView.canGoBack()
+                binding.btnForward.isEnabled = binding.webView.canGoForward()
             }
 
             override fun onDestroy() {
@@ -648,8 +720,13 @@ def generate_android_harness(
         <?xml version="1.0" encoding="utf-8"?>
         <resources>
             <string name="app_name">{app_name}</string>
-            <string name="load">Load</string>
+            <string name="load_target">Load Target</string>
+            <string name="go">Go</string>
+            <string name="back">Back</string>
+            <string name="forward">Forward</string>
+            <string name="reload">Reload</string>
             <string name="clear">Clear</string>
+            <string name="url_hint">Enter URL or host</string>
             <string name="summary_placeholder">No page loaded yet.</string>
         </resources>
         """
@@ -685,17 +762,72 @@ def generate_android_harness(
                     android:layout_weight="1" />
 
                 <Button
-                    android:id="@+id/btnLoad"
+                    android:id="@+id/btnLoadTarget"
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
                     android:layout_marginStart="8dp"
-                    android:text="@string/load" />
+                    android:text="@string/load_target" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:orientation="horizontal">
+
+                <EditText
+                    android:id="@+id/etUrl"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:hint="@string/url_hint"
+                    android:imeOptions="actionGo"
+                    android:inputType="textUri"
+                    android:maxLines="1" />
+
+                <Button
+                    android:id="@+id/btnGo"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="8dp"
+                    android:text="@string/go" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:orientation="horizontal">
+
+                <Button
+                    android:id="@+id/btnBack"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="@string/back" />
+
+                <Button
+                    android:id="@+id/btnForward"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="8dp"
+                    android:layout_weight="1"
+                    android:text="@string/forward" />
+
+                <Button
+                    android:id="@+id/btnReload"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="8dp"
+                    android:layout_weight="1"
+                    android:text="@string/reload" />
 
                 <Button
                     android:id="@+id/btnClear"
-                    android:layout_width="wrap_content"
+                    android:layout_width="0dp"
                     android:layout_height="wrap_content"
                     android:layout_marginStart="8dp"
+                    android:layout_weight="1"
                     android:text="@string/clear" />
             </LinearLayout>
 
@@ -747,6 +879,70 @@ def generate_android_harness(
 
     for path, content in files.items():
         write_text(path, content)
+
+
+def run_checked(cmd: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
+    completed = subprocess.run(
+        cmd,
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        stderr = completed.stderr.strip()
+        stdout = completed.stdout.strip()
+        message = stderr or stdout or "Unknown command failure"
+        raise RuntimeError(f"Command failed: {' '.join(cmd)}\n{message}")
+    return completed
+
+
+def ensure_gradle_wrapper(project_dir: Path) -> Path:
+    gradlew = project_dir / "gradlew"
+    if gradlew.exists():
+        gradlew.chmod(gradlew.stat().st_mode | 0o111)
+        return gradlew
+
+    gradle_bin = shutil.which("gradle")
+    if gradle_bin is None:
+        raise RuntimeError(
+            "Gradle wrapper not found in generated project and `gradle` is not installed. "
+            "Install Gradle, or open the project once in Android Studio to bootstrap wrapper files."
+        )
+
+    run_checked([gradle_bin, "wrapper"], cwd=project_dir)
+    if not gradlew.exists():
+        raise RuntimeError("Failed to generate gradle wrapper (`gradlew`).")
+
+    gradlew.chmod(gradlew.stat().st_mode | 0o111)
+    return gradlew
+
+
+def build_debug_apk(project_dir: Path, out_dir: Path) -> Path:
+    gradlew = ensure_gradle_wrapper(project_dir)
+    run_checked([str(gradlew), "--no-daemon", "assembleDebug"], cwd=project_dir)
+
+    apk_candidates = sorted((project_dir / "app/build/outputs/apk/debug").glob("*.apk"))
+    if not apk_candidates:
+        apk_candidates = sorted(project_dir.rglob("app-debug*.apk"))
+    if not apk_candidates:
+        raise RuntimeError("Build completed but no debug APK was found under app/build/outputs.")
+
+    source_apk = apk_candidates[0]
+    target_apk = out_dir / "repro-harness-debug.apk"
+    shutil.copy2(source_apk, target_apk)
+    return target_apk
+
+
+def install_apk_via_adb(apk_path: Path, adb_serial: str | None) -> None:
+    adb_bin = shutil.which("adb")
+    if adb_bin is None:
+        raise RuntimeError("`adb` is not installed or not on PATH.")
+
+    cmd = [adb_bin]
+    if adb_serial:
+        cmd.extend(["-s", adb_serial])
+    cmd.extend(["install", "-r", str(apk_path)])
+    run_checked(cmd, cwd=apk_path.parent)
 
 
 def generate_markdown_report(report: dict[str, Any]) -> str:
@@ -814,11 +1010,28 @@ def parse_args() -> argparse.Namespace:
         default=[],
         help="Force include additional URL (can repeat)",
     )
+    parser.add_argument(
+        "--build-apk",
+        action="store_true",
+        help="Build installable debug APK after generating the Android project",
+    )
+    parser.add_argument(
+        "--install-via-adb",
+        action="store_true",
+        help="Install built debug APK on a connected Android device using adb -r",
+    )
+    parser.add_argument(
+        "--adb-serial",
+        default=None,
+        help="ADB device serial to use with --install-via-adb (optional)",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+    if args.install_via_adb:
+        args.build_apk = True
 
     apk_path = Path(args.apk).expanduser().resolve()
     out_dir = Path(args.out).expanduser().resolve()
@@ -892,6 +1105,16 @@ def main() -> int:
         targets_payload=targets_payload,
     )
 
+    built_apk_path: Path | None = None
+    if args.build_apk:
+        try:
+            built_apk_path = build_debug_apk(project_dir, out_dir)
+            if args.install_via_adb:
+                install_apk_via_adb(built_apk_path, args.adb_serial)
+        except RuntimeError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+
     output_readme = textwrap.dedent(
         f"""\
         # Repro Output
@@ -908,8 +1131,15 @@ def main() -> int:
         3. Open `chrome://inspect/#devices` in desktop Chrome.
         4. Inspect the WebView and compare Network + Performance timelines.
 
+        ## Optional CLI Build
+        - Generate installable debug APK directly:
+          `python3 repro_creator.py --apk /path/to/app.apk --out /path/to/out --build-apk`
+        - APK output path:
+          `repro-harness-debug.apk`
+
         ## Notes
         - Source APK is not modified.
+        - The original protected APK cannot be recreated byte-for-byte (different code/signing key).
         - Add known URLs with `--extra-url https://...`.
         """
     )
@@ -918,6 +1148,10 @@ def main() -> int:
     print(f"Generated repro bundle at: {out_dir}")
     print(f"Analysis report: {analysis_dir / 'report.md'}")
     print(f"Android harness: {project_dir}")
+    if built_apk_path is not None:
+        print(f"Installable debug APK: {built_apk_path}")
+        if args.install_via_adb:
+            print("Installed on connected device via adb.")
     return 0
 
 

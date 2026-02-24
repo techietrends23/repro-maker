@@ -6,6 +6,7 @@ It does not modify the original app. It extracts likely web URLs from APK conten
 - `WebView.setWebContentsDebuggingEnabled(true)` for `chrome://inspect`
 - native lifecycle timings (`onPageStarted`, `onPageCommitVisible`, `onPageFinished`)
 - JS Navigation/Resource timing capture (`performance.getEntriesByType(...)`)
+- URL entry + navigation controls (Go, Back, Forward, Reload, Clear)
 
 ## Requirements
 - Python 3.9+
@@ -25,12 +26,15 @@ Optional flags:
 --extra-url https://your-primary-web-entry.example.com
 --package-id com.yourorg.repro
 --app-name "My WebView Repro"
+--build-apk
+--install-via-adb --adb-serial YOUR_DEVICE_SERIAL
 ```
 
 ## Output
 - `out/repro/analysis/report.json`
 - `out/repro/analysis/report.md`
 - `out/repro/webview-repro-harness/` (Android project)
+- `out/repro/repro-harness-debug.apk` (when `--build-apk` is used)
 
 ## Run and debug
 1. Open `webview-repro-harness` in Android Studio.
@@ -39,5 +43,6 @@ Optional flags:
 4. Inspect the WebView and compare Network + Performance traces against web baseline.
 
 ## Notes
+- The original protected APK cannot be recreated exactly (different binary/signing keys).
 - If the APK is obfuscated/encrypted, URL extraction may be partial.
 - Add known URLs with `--extra-url` to force inclusion.
