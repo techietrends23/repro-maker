@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import textwrap
+import time
 import zipfile
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
@@ -223,10 +224,9 @@ def main_activity_template(package_id: str) -> str:
 
             override fun onCreate(savedInstanceState: Bundle?) {
                 super.onCreate(savedInstanceState)
+                WebView.setWebContentsDebuggingEnabled(true)
                 binding = ActivityMainBinding.inflate(layoutInflater)
                 setContentView(binding.root)
-
-                WebView.setWebContentsDebuggingEnabled(true)
                 configureWebView()
                 configureButtons()
                 loadTargets()
@@ -703,6 +703,7 @@ def generate_android_harness(
                 android:label="@string/app_name"
                 android:supportsRtl="true"
                 android:theme="@style/Theme.ReproHarness"
+                android:debuggable="true"
                 android:usesCleartextTraffic="true">
                 <activity
                     android:name=".MainActivity"
@@ -998,13 +999,7 @@ def build_debug_apk(project_dir: Path, out_dir: Path) -> Path:
 
 
 def install_apk_via_adb(apk_path: Path, adb_serial: str | None) -> None:
-    adb_bin = shutil.which("adb")
-    if adb_bin is None:
-        raise RuntimeError("`adb` is not installed or not on PATH.")
-
-    cmd = [adb_bin]
-    if adb_serial:
-        cmd.extend(["-s", adb_serial])
+    cmd = adb_base_cmd(resolve_adb_serial(adb_serial))
     cmd.extend(["install", "-r", str(apk_path)])
     run_checked(cmd, cwd=apk_path.parent)
 
@@ -1019,8 +1014,42 @@ def adb_base_cmd(adb_serial: str | None) -> list[str]:
     return cmd
 
 
+def connected_adb_devices() -> list[str]:
+    adb_bin = shutil.which("adb")
+    if adb_bin is None:
+        raise RuntimeError("`adb` is not installed or not on PATH.")
+    completed = run_checked([adb_bin, "devices"], cwd=Path.cwd())
+    devices = []
+    for line in completed.stdout.splitlines():
+        line = line.strip()
+        if not line or line.startswith("List of devices"):
+            continue
+        parts = line.split()
+        if len(parts) >= 2 and parts[1] == "device":
+            devices.append(parts[0])
+    return devices
+
+
+def resolve_adb_serial(adb_serial: str | None) -> str | None:
+    if adb_serial:
+        return adb_serial
+
+    devices = connected_adb_devices()
+    if not devices:
+        raise RuntimeError(
+            "No adb devices connected. Connect a device and authorize USB debugging."
+        )
+    if len(devices) > 1:
+        listed = ", ".join(devices)
+        raise RuntimeError(
+            "Multiple adb devices detected. Pass --adb-serial explicitly. "
+            f"Detected: {listed}"
+        )
+    return devices[0]
+
+
 def list_installed_device_packages(adb_serial: str | None) -> list[str]:
-    adb_cmd = adb_base_cmd(adb_serial)
+    adb_cmd = adb_base_cmd(resolve_adb_serial(adb_serial))
     resolved = run_checked(adb_cmd + ["shell", "pm", "list", "packages", "-3"], cwd=Path.cwd())
 
     packages = []
@@ -1070,7 +1099,7 @@ def pull_apk_from_device(
     package_name: str,
     adb_serial: str | None,
 ) -> tuple[Path, list[Path]]:
-    adb_cmd = adb_base_cmd(adb_serial)
+    adb_cmd = adb_base_cmd(resolve_adb_serial(adb_serial))
 
     resolved = run_checked(adb_cmd + ["shell", "pm", "path", package_name], cwd=out_dir)
     remote_paths = []
@@ -1110,6 +1139,35 @@ def pull_apk_from_device(
 
     base_apk = next((p for p in pulled_files if p.name == "base.apk"), pulled_files[0])
     return base_apk, pulled_files
+
+
+def launch_app_via_adb(package_id: str, adb_serial: str | None) -> None:
+    adb_cmd = adb_base_cmd(resolve_adb_serial(adb_serial))
+    run_checked(adb_cmd + ["shell", "monkey", "-p", package_id, "-c", "android.intent.category.LAUNCHER", "1"], cwd=Path.cwd())
+
+
+def list_webview_devtools_sockets(adb_serial: str | None) -> list[str]:
+    adb_cmd = adb_base_cmd(resolve_adb_serial(adb_serial))
+    completed = run_checked(adb_cmd + ["shell", "cat", "/proc/net/unix"], cwd=Path.cwd())
+    sockets = []
+    for line in completed.stdout.splitlines():
+        if "webview_devtools_remote" in line:
+            sockets.append(line.strip())
+    return sockets
+
+
+def wait_for_devtools_socket(adb_serial: str | None, timeout_seconds: int) -> list[str]:
+    deadline = time.time() + timeout_seconds
+    last = []
+    while time.time() < deadline:
+        try:
+            last = list_webview_devtools_sockets(adb_serial)
+        except RuntimeError:
+            last = []
+        if last:
+            return last
+        time.sleep(1)
+    return last
 
 
 def generate_markdown_report(report: dict[str, Any]) -> str:
@@ -1202,6 +1260,17 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="ADB device serial to use with --install-via-adb (optional)",
     )
+    parser.add_argument(
+        "--launch-after-install",
+        action="store_true",
+        help="Launch installed repro app via adb after --install-via-adb",
+    )
+    parser.add_argument(
+        "--wait-devtools-seconds",
+        type=int,
+        default=15,
+        help="How long to wait for WebView devtools socket after launch",
+    )
     return parser.parse_args()
 
 
@@ -1209,6 +1278,8 @@ def main() -> int:
     args = parse_args()
     if args.install_via_adb:
         args.build_apk = True
+        args.launch_after_install = True
+    debug_package_id = f"{args.package_id}.debug"
 
     out_dir = Path(args.out).expanduser().resolve()
     pulled_apks: list[Path] = []
@@ -1312,11 +1383,18 @@ def main() -> int:
     )
 
     built_apk_path: Path | None = None
+    devtools_sockets: list[str] = []
     if args.build_apk:
         try:
             built_apk_path = build_debug_apk(project_dir, out_dir)
             if args.install_via_adb:
                 install_apk_via_adb(built_apk_path, args.adb_serial)
+                if args.launch_after_install:
+                    launch_app_via_adb(debug_package_id, args.adb_serial)
+                    devtools_sockets = wait_for_devtools_socket(
+                        args.adb_serial,
+                        timeout_seconds=max(1, args.wait_devtools_seconds),
+                    )
         except RuntimeError as exc:
             print(str(exc), file=sys.stderr)
             return 2
@@ -1342,6 +1420,10 @@ def main() -> int:
           `python3 repro_creator.py --apk /path/to/app.apk --out /path/to/out --build-apk`
         - APK output path:
           `repro-harness-debug.apk`
+        - Expected installed debug package:
+          `{debug_package_id}`
+        - Build + install + launch:
+          `python3 repro_creator.py --apk /path/to/app.apk --out /path/to/out --build-apk --install-via-adb --adb-serial YOUR_DEVICE`
         - If Gradle is missing, the tool auto-downloads Gradle {DEFAULT_GRADLE_VERSION} under `.tool-cache/`.
 
         ## Notes
@@ -1355,6 +1437,7 @@ def main() -> int:
     print(f"Generated repro bundle at: {out_dir}")
     print(f"Analysis report: {analysis_dir / 'report.md'}")
     print(f"Android harness: {project_dir}")
+    print(f"Expected debug package id: {debug_package_id}")
     print(f"Source: {source_descriptor}")
     if pulled_apks:
         print(f"Pulled APK files: {len(pulled_apks)}")
@@ -1364,6 +1447,17 @@ def main() -> int:
         print(f"Installable debug APK: {built_apk_path}")
         if args.install_via_adb:
             print("Installed on connected device via adb.")
+            if args.launch_after_install:
+                print(f"Launched package: {debug_package_id}")
+                if devtools_sockets:
+                    print("Detected WebView devtools sockets:")
+                    for row in devtools_sockets:
+                        print(f"- {row}")
+                else:
+                    print(
+                        "No WebView devtools socket detected yet. Keep app open in foreground "
+                        "and check chrome://inspect/#devices."
+                    )
     return 0
 
 

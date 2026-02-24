@@ -45,6 +45,7 @@ Optional flags:
 --app-name "My WebView Repro"
 --build-apk
 --install-via-adb --adb-serial YOUR_DEVICE_SERIAL
+--launch-after-install
 ```
 
 ## Output
@@ -58,11 +59,31 @@ Optional flags:
 2. Run the debug app on a device/emulator.
 3. In Chrome desktop: `chrome://inspect/#devices`.
 4. Inspect the WebView and compare Network + Performance traces against web baseline.
+5. Keep the repro app in foreground with a loaded web page while inspecting.
+
+One-command build + install + launch:
+```bash
+python3 repro_creator.py \
+  --interactive-device-select \
+  --out ./out/repro \
+  --build-apk \
+  --install-via-adb \
+  --adb-serial YOUR_DEVICE_SERIAL
+```
+
+## If WebView Is Not Visible In Inspect
+1. Verify adb connectivity: `adb devices`
+2. Verify installed repro package is debuggable:
+   `adb shell dumpsys package com.reprocreator.harness.debug | grep -i debuggable`
+3. Check devtools socket exists:
+   `adb shell cat /proc/net/unix | grep -i webview_devtools_remote`
+4. In `chrome://inspect`, enable **Discover USB devices** and reconnect device.
 
 ## Notes
 - The original protected APK cannot be recreated exactly (different binary/signing keys).
 - `--build-apk` auto-downloads Gradle if it is not installed locally.
 - `--device-package` pulls the installed APK splits from device via `adb` and uses `base.apk` for analysis.
 - `--interactive-device-select` lists installed third-party packages (`pm list packages -3`) and prompts for a numeric selection.
+- `--install-via-adb` now auto-launches the repro app and waits for a WebView devtools socket check.
 - If the APK is obfuscated/encrypted, URL extraction may be partial.
 - Add known URLs with `--extra-url` to force inclusion.
